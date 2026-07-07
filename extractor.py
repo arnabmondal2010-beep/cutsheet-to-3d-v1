@@ -5,7 +5,7 @@ Uses pdfplumber's table detection + a small parser for inches like 8-5/8".
 
 import re
 from dataclasses import dataclass, asdict
-from typing import List, Dict, Optional
+from typing import List, Optional
 
 import pdfplumber
 import pandas as pd
@@ -18,8 +18,7 @@ _FRAC     = re.compile(r"^\s*(\d+)?[\s-]*(\d+)/(\d+)")   # 8-5/8  or  5/8
 _HP_FRAC  = re.compile(r"(\d+)\s*/\s*(\d+)\s*th?", re.I) # 1/12th, 1/6th, 2/5th
 
 
-def parse_inches_to_mm(cell: str) -> Optional[float]:
-     (mm) value in parentheses; else parse the fractional inches."""
+def parse_inches_to_mm(cell: str) -> Optional"""Prefer the (mm) value in parentheses; else parse the fractional inches."""
     if not cell:
         return None
     m = _MM_PAREN.search(cell)
@@ -49,6 +48,16 @@ def parse_hp(cell: str) -> Optional"""'1/12th' -> 0.0833, '2/5th' -> 0.4"""
         return None
 
 
+def _first_int(cell: str) -> Optional[int]:
+    m = re.search(r"\d+", cell or "")
+    return int(m.group()) if m else None
+
+
+def _weight_kg(cell: str) -> Optional[float]:
+    m = re.search(r"\(([\d.]+)\)", cell or "")
+    return float(m.group(1)) if m else None
+
+
 # ---------- data model ----------
 
 @dataclass
@@ -71,27 +80,30 @@ class PumpSpec:
 
 MODEL_RX = re.compile(r"^PL-\d+[A-Z]?(?:/\s*\d+\")?$")
 
-def extract_pumps(pdf_bytes: bytes) -> List"""Read every page, find spec rows starting with 'PL-xx', return PumpSpec list."""
+
+def extract_pumps(pdf_bytes) -> List"""Read every page, find spec rows starting with 'PL-xx', return PumpSpec list."""
     rows: List[PumpSpec] = []
     with pdfplumber.open(pdf_bytes) as pdf:
         for page in pdf.pages:
             for table in page.extract_tables() or []:
                 for row in table:
                     row = [(c or "").strip() for c in row]
-                    if not row or not MODEL_RX.match(row[0].replace(" ", "")):
+                    if not row:
                         continue
-                    # Heuristic column mapping — resilient to blank cells
+                    first = row[0].replace(" ", "")
+                    if not MODEL_RX.match(first):
+                        continue
                     cols = row + [""] * (16 - len(row))
                     try:
                         rows.append(PumpSpec(
-                            model        = cols[0],
+                            model        = cols[0].strip(),
                             part_number  = cols[1],
                             flange_sizes = cols[4],
                             hp           = parse_hp(cols[5]),
                             voltage      = _first_int(cols[7]) or 115,
                             rpm          = _first_int(cols[8]),
                             A_mm         = parse_inches_to_mm(cols[9]),
-                            B_mm        = parse_inches_to_mm(cols[10]),
+                            B_mm         = parse_inches_to_mm(cols[10]),
                             C_mm         = parse_inches_to_mm(cols[11]),
                             D_mm         = parse_inches_to_mm(cols[12]),
                             E_mm         = parse_inches_to_mm(cols[13]),
@@ -99,6 +111,7 @@ def extract_pumps(pdf_bytes: bytes) -> List"""Read every page, find spec rows st
                         ))
                     except Exception:
                         continue
+
     # de-duplicate on model
     seen, unique = set(), []
     for p in rows:
@@ -107,16 +120,6 @@ def extract_pumps(pdf_bytes: bytes) -> List"""Read every page, find spec rows st
         seen.add(p.model)
         unique.append(p)
     return unique
-
-
-def _first_int(cell: str) -> Optional[int]:
-    m = re.search(r"\d+", cell or "")
-    return int(m.group()) if m else None
-
-
-def _weight_kg(cell: str) -> Optional[float]:
-    m = re.search(r"\(([\d.]+)\)", cell or "")
-    return float(m.group(1)) if m else None
 
 
 def as_dataframe(pumps: List[PumpSpec]) -> pd.DataFrame:
