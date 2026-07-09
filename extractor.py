@@ -3,6 +3,9 @@ extractor.py — Universal cutsheet extractor.
 Supports:
   1. Bell & Gossett Series PL inline circulators (pumps)
   2. Trane CLCA Series Flexible Air Handling Units (AHUs)
+
+Handles both ruled AND unruled tables (Trane uses text-positioned columns
+without visible grid lines, so we need a text-line fallback).
 """
 
 import re
@@ -22,6 +25,7 @@ _HP_FRAC  = re.compile(r"(\d+)\s*/\s*(\d+)\s*th?", re.I)
 
 
 def parse_inches_to_mm(cell):
+    """'8-5/8' or '(219)' -> mm."""
     if not cell:
         return None
     m = _MM_PAREN.search(cell)
@@ -40,6 +44,7 @@ def parse_inches_to_mm(cell):
 
 
 def parse_hp(cell):
+    """'1/12th' -> 0.0833 ; '2/5th' -> 0.4"""
     if not cell:
         return None
     m = _HP_FRAC.search(cell)
@@ -95,6 +100,7 @@ class PumpSpec:
 
 
 def extract_pumps(pdf_bytes):
+    """Scan all pages for rows starting with 'PL-xx'; return list of PumpSpec."""
     rows = []
     with pdfplumber.open(pdf_bytes) as pdf:
         for page in pdf.pages:
@@ -124,6 +130,8 @@ def extract_pumps(pdf_bytes):
                         ))
                     except Exception:
                         continue
+
+    # de-duplicate on model
     seen = set()
     unique = []
     for p in rows:
@@ -156,42 +164,109 @@ class AhuSpec:
     height_50mm: float
 
 
+def _parse_ahu_row_cells(model, row):
+    """Given a structured table row, try to build an AhuSpec."""
+    nums = [_try_float(c) for c in row[1:]]
+    nums = [n for n in nums if n is not None]
+    if len(nums) < 6:
+        return None
+    airflow = nums[0]
+    coil_area = nums[1] if nums[1] < 20 else 0.0
+    dims = [n for n in nums if 500 <= n <= 6000]
+    if len(dims) < 4:
+        return None
+    w25, w50, h25, h50 = dims[-4], dims[-3], dims[-2], dims[-1]
+    if airflow < 500:
+        return None
+    return AhuSpec(
+        model=model,
+        nominal_airflow_cmh=airflow,
+        coil_face_area_m2=coil_area,
+        width_25mm=w25,
+        width_50mm=w50,
+        height_25mm=h25,
+        height_50mm=h50,
+    )
+
+
+# Text-line regex — for PDFs where pdfplumber returns no tables (unruled tables).
+# Example line from Trane CLCA:
+#   "003 2300 0.23 1656 1863 2070 2277 2484 689 739 789 839"
+_AHU_LINE_RX = re.compile(
+    r"^\s*(0\d{2}|100)\s+"
+    r"(\d{3,6})\s+"
+    r"(\d+(?:\.\d+)?)\s+"
+    r"(?:\d+(?:\.\d+)?\s+){4,6}"
+    r"(\d{3,4})\s+(\d{3,4})\s+(\d{3,4})\s+(\d{3,4})\s*$"
+)
+
+
+def _parse_ahu_row_text(line):
+    """Parse an unruled text line into an AhuSpec (or None)."""
+    line = re.sub(r"\s+", " ", line.strip())
+    m = _AHU_LINE_RX.match(line)
+    if not m:
+        return None
+    model = m.group(1)
+    airflow = float(m.group(2))
+    coil_area = float(m.group(3))
+    w25 = float(m.group(4))
+    w50 = float(m.group(5))
+    h25 = float(m.group(6))
+    h50 = float(m.group(7))
+    if airflow < 500:
+        return None
+    return AhuSpec(
+        model=model,
+        nominal_airflow_cmh=airflow,
+        coil_face_area_m2=coil_area,
+        width_25mm=w25,
+        width_50mm=w50,
+        height_25mm=h25,
+        height_50mm=h50,
+    )
+
+
 def extract_ahus(pdf_bytes):
+    """Extract Trane CLCA AHU specs. Tries structured tables first, then text lines."""
     rows = []
-    with pdfplumber.open(pdf_bytes) as pdf:
-        for page in pdf.pages:
-            for table in page.extract_tables() or []:
-                for row in table:
-                    row = [(c or "").strip() for c in row]
-                    if len(row) < 9:
-                        continue
-                    first = row[0].replace(" ", "")
-                    if not AHU_MODEL_RX.match(first):
-                        continue
-                    airflow = _try_float(row[1])
-                    coil_area = _try_float(row[2])
-                    tail_nums = []
-                    for c in reversed(row):
-                        v = _try_float(c)
-                        if v is not None and 500 <= v <= 6000:
-                            tail_nums.append(v)
-                            if len(tail_nums) == 4:
-                                break
-                    if len(tail_nums) < 4:
-                        continue
-                    tail_nums = list(reversed(tail_nums))
-                    w25, w50, h25, h50 = tail_nums
-                    if not airflow:
-                        continue
-                    rows.append(AhuSpec(
-                        model=first,
-                        nominal_airflow_cmh=airflow,
-                        coil_face_area_m2=coil_area or 0.0,
-                        width_25mm=w25,
-                        width_50mm=w50,
-                        height_25mm=h25,
-                        height_50mm=h50,
-                    ))
+
+    # Attempt 1: structured tables (ruled PDFs)
+    try:
+        with pdfplumber.open(pdf_bytes) as pdf:
+            for page in pdf.pages:
+                for table in page.extract_tables() or []:
+                    for row in table:
+                        row = [(c or "").strip() for c in row]
+                        if len(row) < 9:
+                            continue
+                        first = row[0].replace(" ", "")
+                        if not AHU_MODEL_RX.match(first):
+                            continue
+                        parsed = _parse_ahu_row_cells(first, row)
+                        if parsed:
+                            rows.append(parsed)
+    except Exception:
+        pass
+
+    # Attempt 2: text-line fallback (unruled PDFs like Trane's)
+    if not rows:
+        try:
+            pdf_bytes.seek(0)
+        except Exception:
+            pass
+        try:
+            with pdfplumber.open(pdf_bytes) as pdf:
+                for page in pdf.pages:
+                    text = page.extract_text() or ""
+                    for line in text.split("\n"):
+                        parsed = _parse_ahu_row_text(line)
+                        if parsed:
+                            rows.append(parsed)
+        except Exception:
+            pass
+
+    # de-duplicate on model
     seen = set()
     unique = []
     for a in rows:
@@ -218,59 +293,70 @@ def _model_to_int(model_str):
 
 
 def get_section_length(section_key, model_str):
+    """Return section length in mm for a given AHU model size."""
     m = _model_to_int(model_str)
+
+    # Mixing box & supply airflow lengths depend on model size
     if section_key in ("mixing", "supply"):
         if 3 <= m <= 20: return 310
         if 25 <= m <= 35: return 465
         if 40 <= m <= 50: return 620
         if 60 <= m <= 80: return 775
         return 930
+
     fixed = {
-        "prefilter":            155,
-        "secondary_filter":     465,
-        "flat_bag_filter":      620,
-        "cool_coil_2row":       310,
-        "cool_coil_4row":       465,
-        "cool_coil_6row":       465,
-        "cool_coil_8_12row":    620,
-        "hot_coil_1_2row":      310,
-        "hot_coil_4row":        465,
-        "steam_coil":           310,
-        "electric_heater":      465,
-        "steam_humidifier":     775,
-        "film_humidifier":      310,
-        "fan":                  1240,
-        "sound_attenuator":     620,
-        "access":               465,
-        "heat_wheel":           620,
+        "prefilter":             155,
+        "secondary_filter":      465,
+        "flat_bag_filter":       620,
+        "cool_coil_2row":        310,
+        "cool_coil_4row":        465,
+        "cool_coil_6row":        465,
+        "cool_coil_8_12row":     620,
+        "hot_coil_1_2row":       310,
+        "hot_coil_4row":         465,
+        "steam_coil":            310,
+        "electric_heater":       465,
+        "steam_humidifier":      775,
+        "film_humidifier":       310,
+        "fan":                   1240,
+        "sound_attenuator":      620,
+        "access":                465,
+        "heat_wheel":            620,
         "high_press_humidifier": 1240,
     }
     return fixed.get(section_key, 465)
 
 
 AHU_SECTION_CATALOG = [
-    ("mixing",           "Mixing Box / Intake",           True),
-    ("prefilter",        "Pre-filter (flat)",             True),
-    ("secondary_filter", "Secondary Filter (bag)",        True),
-    ("cool_coil_6row",   "Cooling Coil (6-row)",          True),
-    ("hot_coil_1_2row",  "Hot Water Coil (1-2 row)",      False),
-    ("electric_heater",  "Electric Heater",               False),
-    ("steam_humidifier", "Steam Humidifier",              False),
-    ("film_humidifier",  "Film Humidifier",               False),
-    ("fan",              "Fan Section",                   True),
-    ("sound_attenuator", "Sound Attenuator",              False),
-    ("access",           "Access Section",                True),
-    ("heat_wheel",       "Heat Recovery Wheel",           False),
-    ("supply",           "Supply Airflow / Discharge",    True),
+    ("mixing",           "Mixing Box / Intake",         True),
+    ("prefilter",        "Pre-filter (flat)",           True),
+    ("secondary_filter", "Secondary Filter (bag)",      True),
+    ("cool_coil_6row",   "Cooling Coil (6-row)",        True),
+    ("hot_coil_1_2row",  "Hot Water Coil (1-2 row)",    False),
+    ("electric_heater",  "Electric Heater",             False),
+    ("steam_humidifier", "Steam Humidifier",            False),
+    ("film_humidifier",  "Film Humidifier",             False),
+    ("fan",              "Fan Section",                 True),
+    ("sound_attenuator", "Sound Attenuator",            False),
+    ("access",           "Access Section",              True),
+    ("heat_wheel",       "Heat Recovery Wheel",         False),
+    ("supply",           "Supply Airflow / Discharge",  True),
 ]
 
 
 # ============================================================
-#  Auto-detection  (THIS IS THE FUNCTION THAT WAS MISSING!)
+#  Auto-detection
 # ============================================================
 
 def detect_and_extract(pdf_bytes):
-    """Return (equipment_type, list_of_specs)."""
+    """Return (equipment_type, list_of_specs).
+    equipment_type is 'pump', 'ahu', or 'unknown'."""
+
+    # Try pump first
+    try:
+        pdf_bytes.seek(0)
+    except Exception:
+        pass
     try:
         pumps = extract_pumps(pdf_bytes)
     except Exception:
@@ -278,11 +364,11 @@ def detect_and_extract(pdf_bytes):
     if pumps:
         return "pump", pumps
 
+    # Then AHU
     try:
         pdf_bytes.seek(0)
     except Exception:
         pass
-
     try:
         ahus = extract_ahus(pdf_bytes)
     except Exception:
