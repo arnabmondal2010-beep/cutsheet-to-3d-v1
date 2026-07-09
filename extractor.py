@@ -168,10 +168,8 @@ def extract_ahus(pdf_bytes):
                     first = row[0].replace(" ", "")
                     if not AHU_MODEL_RX.match(first):
                         continue
-                    # Quick-selection table has ~12 columns ending with W25 W50 H25 H50
                     airflow = _try_float(row[1])
                     coil_area = _try_float(row[2])
-                    # Take the last 4 numeric-looking cells
                     tail_nums = []
                     for c in reversed(row):
                         v = _try_float(c)
@@ -181,7 +179,6 @@ def extract_ahus(pdf_bytes):
                                 break
                     if len(tail_nums) < 4:
                         continue
-                    # Reverse back to natural order: W25 W50 H25 H50
                     tail_nums = list(reversed(tail_nums))
                     w25, w50, h25, h50 = tail_nums
                     if not airflow:
@@ -221,7 +218,6 @@ def _model_to_int(model_str):
 
 
 def get_section_length(section_key, model_str):
-    """Return section length in mm for a given AHU size."""
     m = _model_to_int(model_str)
     if section_key in ("mixing", "supply"):
         if 3 <= m <= 20: return 310
@@ -252,7 +248,6 @@ def get_section_length(section_key, model_str):
     return fixed.get(section_key, 465)
 
 
-# key, friendly label, default checked
 AHU_SECTION_CATALOG = [
     ("mixing",           "Mixing Box / Intake",           True),
     ("prefilter",        "Pre-filter (flat)",             True),
@@ -271,13 +266,11 @@ AHU_SECTION_CATALOG = [
 
 
 # ============================================================
-#  Auto-detection
+#  Auto-detection  (THIS IS THE FUNCTION THAT WAS MISSING!)
 # ============================================================
 
 def detect_and_extract(pdf_bytes):
-    """Return (equipment_type, list_of_specs).
-    equipment_type is one of 'pump', 'ahu', 'unknown'."""
-    # Read once, try both extractors
+    """Return (equipment_type, list_of_specs)."""
     try:
         pumps = extract_pumps(pdf_bytes)
     except Exception:
@@ -285,7 +278,6 @@ def detect_and_extract(pdf_bytes):
     if pumps:
         return "pump", pumps
 
-    # Re-seek needed — pdfplumber consumed the stream
     try:
         pdf_bytes.seek(0)
     except Exception:
