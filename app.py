@@ -274,8 +274,9 @@ elif eq_type == "ahu":
             if not section_triples:
                 st.warning("Select at least one section.")
                 st.stop()
-            st.session_state["ahu_mesh"] = build_ahu(W, H, section_triples)
+            st.session_state["ahu_mesh"] = build_ahu(W, H, section_triples, quality)
             st.session_state["ahu_sections"] = section_triples
+            st.session_state["ahu_signature"] = ahu_signature
 
         mesh = st.session_state["ahu_mesh"]
         fig = go.Figure(data=[mesh_to_plotly(mesh, color="#BAC0C6")])
